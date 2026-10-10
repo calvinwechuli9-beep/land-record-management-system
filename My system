@@ -1,0 +1,1840 @@
+# LandTrust Kenya – Complete Source Code
+
+Land Records Management System · Node.js + Express + SQLite
+
+## Contents
+
+1. `package.json` – Project configuration and dependencies
+2. `server.js` – Starts the server and connects the routes
+3. `database/schema.sql` – Database tables: users, land_records, audit_log
+4. `database/index.js` – Opens the database, audit helper, demo data
+5. `utils/helpers.js` – Password hashing, date formatting, role names
+6. `middleware/auth.js` – Sessions and role-based access guard
+7. `middleware/upload.js` – Title deed file uploads
+8. `routes/auth.routes.js` – Login, logout, session check
+9. `routes/records.routes.js` – LAND RECORDS: search, add, duplicate detection, edit, deed upload
+10. `routes/admin.routes.js` – Audit trail, user accounts, database viewer
+11. `public/index.html` – Page that loads the CSS and scripts
+12. `public/css/style.css` – Styling for login and both dashboards
+13. `public/js/core.js` – Shared state and the API client
+14. `public/js/login.js` – Login page
+15. `public/js/app.js` – Sidebar, navigation and Dashboard
+16. `public/js/records.js` – LAND RECORDS screens: search, add, upload deed, duplicates, edit
+17. `public/js/admin.js` – User accounts, permissions, audit trail, reports, database viewer
+18. `public/js/main.js` – Start-up
+
+**Run:** `npm install` then `npm start`, then open http://localhost:3000. Demo logins: `RO-2026-014` / `officer123` (Records Officer), `ADM-002` / `admin123` (Administrator).
+
+---
+
+## 1. `package.json`
+*Project configuration and dependencies*
+
+````json
+{
+  "name": "landtrust-lrms",
+  "version": "1.0.0",
+  "description": "LandTrust Kenya - Digital Land Records Management System",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.7.0",
+    "express": "^4.21.0",
+    "multer": "^1.4.5-lts.1"
+  },
+  "devDependencies": {
+    "prettier": "^3.9.9"
+  }
+}
+````
+
+## 2. `server.js`
+*Starts the server and connects the routes*
+
+````javascript
+const express = require("express");
+const path = require("path");
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+app.use(express.json());
+app.use(express.static(path.join(__dirname, "public")));
+
+app.use(require("./routes/auth.routes"));
+app.use(require("./routes/records.routes"));
+app.use(require("./routes/admin.routes"));
+
+app.listen(PORT, () => {
+  console.log(`LandTrust LRMS running at http://localhost:${PORT}`);
+});
+````
+
+## 3. `database/schema.sql`
+*Database tables: users, land_records, audit_log*
+
+````sql
+-- LandTrust Kenya LRMS: schema from Figure 2.3.4 (ERD): User, Land_Record, Audit_Log
+CREATE TABLE IF NOT EXISTS users (
+  user_id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  staff_id        TEXT    NOT NULL UNIQUE,
+  full_name       TEXT    NOT NULL,
+  password_hash   TEXT    NOT NULL,
+  role            TEXT    NOT NULL CHECK (role IN ('Records Officer','Administrator')),
+  is_active       INTEGER NOT NULL DEFAULT 1,
+  failed_attempts INTEGER NOT NULL DEFAULT 0,
+  created_at      TEXT    NOT NULL DEFAULT (datetime('now','localtime'))
+);
+
+-- title_number is NOT unique: a duplicate is stored and flagged, not rejected
+CREATE TABLE IF NOT EXISTS land_records (
+  record_id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  title_number      TEXT    NOT NULL,
+  owner_name        TEXT    NOT NULL,
+  national_id       TEXT    NOT NULL,
+  parcel_size       REAL    NOT NULL CHECK (parcel_size > 0),
+  location          TEXT    NOT NULL,
+  land_use          TEXT    NOT NULL,
+  registration_date TEXT    NOT NULL,
+  deed_path         TEXT,
+  status            TEXT    NOT NULL DEFAULT 'Active' CHECK (status IN ('Active','DUPLICATE')),
+  created_by        INTEGER NOT NULL REFERENCES users(user_id),
+  created_at        TEXT    NOT NULL DEFAULT (datetime('now','localtime'))
+);
+CREATE INDEX IF NOT EXISTS idx_land_title ON land_records(title_number);
+
+CREATE TABLE IF NOT EXISTS audit_log (
+  log_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id    INTEGER NOT NULL REFERENCES users(user_id),
+  record_id  INTEGER REFERENCES land_records(record_id),
+  action     TEXT    NOT NULL,
+  record_ref TEXT,
+  logged_at  TEXT    NOT NULL DEFAULT (datetime('now','localtime'))
+);
+````
+
+## 4. `database/index.js`
+*Opens the database, audit helper, demo data*
+
+````javascript
+const Database = require("better-sqlite3");
+const fs = require("fs");
+const path = require("path");
+const { RO, AD, hash } = require("../utils/helpers");
+
+const DB_PATH = path.join(__dirname, "..", "landtrust.db");
+const db = new Database(DB_PATH);
+db.pragma("foreign_keys = ON");
+db.exec(fs.readFileSync(path.join(__dirname, "schema.sql"), "utf8"));
+
+/* ---------- Audit trail: one row per action ---------- */
+function audit(userId, action, ref, recordId = null, at = null) {
+  db.prepare(
+    `INSERT INTO audit_log (user_id, record_id, action, record_ref, logged_at)
+     VALUES (?, ?, ?, ?, COALESCE(?, datetime('now','localtime')))`,
+  ).run(userId, recordId, action, ref, at);
+}
+
+/* ---------- Seed demo data (first run only) ---------- */
+function seed() {
+  if (db.prepare("SELECT COUNT(*) c FROM users").get().c) return;
+
+  const addUser = db.prepare(
+    "INSERT INTO users (staff_id, full_name, password_hash, role) VALUES (?, ?, ?, ?)",
+  );
+  addUser.run("RO-2026-014", "J. Kamau", hash("officer123"), RO);
+  addUser.run("RO-2026-007", "P. Njeri", hash("officer456"), RO);
+  addUser.run("ADM-002", "S. Otieno", hash("admin123"), AD);
+
+  const addRecord = db.prepare(
+    `INSERT INTO land_records
+       (title_number, owner_name, national_id, parcel_size, location,
+        land_use, registration_date, deed_path, status, created_by)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  );
+  addRecord.run(
+    "NAK/1234/2019",
+    "Peter Mwangi",
+    "12345678",
+    1.8,
+    "Nakuru East",
+    "Residential",
+    "2019-03-12",
+    "uploads/0_deed_1234_2019.pdf",
+    "Active",
+    1,
+  );
+  addRecord.run(
+    "NAK/1234/2019",
+    "Jane Wanjiru",
+    "24581234",
+    1.8,
+    "Nakuru East",
+    "Residential",
+    "2026-09-23",
+    null,
+    "DUPLICATE",
+    1,
+  );
+  addRecord.run(
+    "NAK/0987/2015",
+    "Samuel Kiptoo",
+    "20987654",
+    3.2,
+    "Nakuru West",
+    "Agricultural",
+    "2015-08-04",
+    "uploads/0_deed_0987.pdf",
+    "Active",
+    3,
+  );
+  addRecord.run(
+    "NAK/0456/2021",
+    "Grace Achieng",
+    "30456789",
+    0.9,
+    "Njoro",
+    "Commercial",
+    "2021-01-19",
+    "uploads/0_deed_0456.pdf",
+    "Active",
+    2,
+  );
+
+  audit(2, "Generated certificate", "NAK/0456/2021", 4, "2026-09-22 11:47:00");
+  audit(3, "Edited record", "NAK/0987/2015", 3, "2026-09-22 15:02:00");
+  audit(1, "Created new record", "NAK/1234/2019", 2, "2026-09-23 09:14:00");
+  audit(1, "Duplicate flagged", "NAK/1234/2019", 2, "2026-09-23 09:20:00");
+}
+seed();
+
+module.exports = { db, audit, DB_PATH };
+````
+
+## 5. `utils/helpers.js`
+*Password hashing, date formatting, role names*
+
+````javascript
+const crypto = require("crypto");
+
+const RO = "Records Officer";
+const AD = "Administrator";
+const MONTHS = [
+  "Jan",
+  "Feb",
+  "Mar",
+  "Apr",
+  "May",
+  "Jun",
+  "Jul",
+  "Aug",
+  "Sep",
+  "Oct",
+  "Nov",
+  "Dec",
+];
+
+/* ---------- Password hashing (salted scrypt) ---------- */
+function hash(password) {
+  const salt = crypto.randomBytes(16).toString("hex");
+  return salt + ":" + crypto.scryptSync(password, salt, 64).toString("hex");
+}
+
+function verify(password, stored) {
+  const [salt, key] = stored.split(":");
+  return crypto.timingSafeEqual(
+    Buffer.from(key, "hex"),
+    crypto.scryptSync(password, salt, 64),
+  );
+}
+
+/* ---------- Dates ---------- */
+// "2026-09-23" -> "23-Sep-2026"
+function dmy(iso) {
+  const [y, m, d] = iso.slice(0, 10).split("-");
+  return `${d}-${MONTHS[+m - 1]}-${y}`;
+}
+
+// today as "YYYY-MM-DD"
+function today() {
+  const n = new Date();
+  const mm = String(n.getMonth() + 1).padStart(2, "0");
+  const dd = String(n.getDate()).padStart(2, "0");
+  return `${n.getFullYear()}-${mm}-${dd}`;
+}
+
+module.exports = { RO, AD, hash, verify, dmy, today };
+````
+
+## 6. `middleware/auth.js`
+*Sessions and role-based access guard*
+
+````javascript
+const crypto = require("crypto");
+const { db } = require("../database");
+
+// sessionId -> user_id (in memory; cleared when the server restarts)
+const sessions = new Map();
+
+function sessionId(req) {
+  const match = (req.headers.cookie || "").match(/(?:^|; )sid=([a-f0-9]+)/);
+  return match && match[1];
+}
+
+function startSession(res, userId) {
+  const id = crypto.randomBytes(24).toString("hex");
+  sessions.set(id, userId);
+  res.setHeader("Set-Cookie", `sid=${id}; HttpOnly; SameSite=Strict; Path=/`);
+}
+
+function endSession(req, res) {
+  sessions.delete(sessionId(req));
+  res.setHeader("Set-Cookie", "sid=; Max-Age=0; Path=/");
+}
+
+// Route guard. auth() = any logged-in user, auth("Administrator") = admins only
+function auth(role) {
+  return (req, res, next) => {
+    const userId = sessions.get(sessionId(req));
+    const user =
+      userId &&
+      db
+        .prepare("SELECT * FROM users WHERE user_id = ? AND is_active = 1")
+        .get(userId);
+
+    if (!user) return res.status(401).json({ error: "Please log in." });
+    if (role && user.role !== role)
+      return res.status(403).json({ error: "Administrator access required." });
+
+    req.user = user;
+    next();
+  };
+}
+
+const publicUser = (u) => ({
+  uid: u.user_id,
+  id: u.staff_id,
+  name: u.full_name,
+  role: u.role,
+});
+
+module.exports = { auth, startSession, endSession, publicUser };
+````
+
+## 7. `middleware/upload.js`
+*Title deed file uploads*
+
+````javascript
+const multer = require("multer");
+const path = require("path");
+
+// Scanned title deeds are saved to /uploads (max 10 MB each)
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: path.join(__dirname, "..", "uploads"),
+    filename: (req, file, cb) =>
+      cb(null, Date.now() + "_" + file.originalname.replace(/[^\w.\-]/g, "_")),
+  }),
+  limits: { fileSize: 10 * 1024 * 1024 },
+});
+
+module.exports = { upload };
+````
+
+## 8. `routes/auth.routes.js`
+*Login, logout, session check*
+
+````javascript
+/** Login, logout and session check */
+const express = require("express");
+const { db, audit } = require("../database");
+const {
+  auth,
+  startSession,
+  endSession,
+  publicUser,
+} = require("../middleware/auth");
+const { verify } = require("../utils/helpers");
+
+const router = express.Router();
+
+router.post("/api/login", (q, s) => {
+  const id = String(q.body.id || "")
+      .trim()
+      .toUpperCase(),
+    pw = String(q.body.pw || ""),
+    role = q.body.role;
+  const bad = (m, c = 401) => s.status(c).json({ error: m });
+  if (!id || !pw) return bad("Enter your staff ID and password.", 400);
+  const u = db.prepare("SELECT * FROM users WHERE staff_id=?").get(id);
+  if (!u)
+    return bad("Staff ID or password is incorrect. Check both and try again.");
+  if (!u.is_active)
+    return bad(
+      "This account is locked or deactivated. Contact the system administrator.",
+      403,
+    );
+  if (!verify(pw, u.password_hash)) {
+    const f = u.failed_attempts + 1;
+    db.prepare(
+      "UPDATE users SET failed_attempts=?,is_active=? WHERE user_id=?",
+    ).run(f, f >= 3 ? 0 : 1, u.user_id);
+    return f >= 3
+      ? bad(
+          "Too many failed attempts. Account locked; contact the system administrator.",
+          403,
+        )
+      : bad(`Staff ID or password is incorrect. ${3 - f} attempt(s) left.`);
+  }
+  if (u.role !== role)
+    return bad(
+      `This account is not registered as ${role}. Select the correct role.`,
+      403,
+    );
+  db.prepare("UPDATE users SET failed_attempts=0 WHERE user_id=?").run(
+    u.user_id,
+  );
+  startSession(s, u.user_id);
+  audit(u.user_id, "Logged in", "—");
+  s.json({ user: publicUser(u) });
+});
+router.get("/api/me", auth(), (q, s) => s.json({ user: publicUser(q.user) }));
+router.post("/api/logout", auth(), (q, s) => {
+  audit(q.user.user_id, "Logged out", "—");
+  endSession(q, s);
+  s.json({ ok: true });
+});
+
+module.exports = router;
+````
+
+## 9. `routes/records.routes.js`
+*LAND RECORDS: search, add, duplicate detection, edit, deed upload*
+
+````javascript
+/**
+ * Land record routes
+ *   GET   /api/records              search / list records
+ *   POST  /api/records              add a record (detects duplicates)
+ *   PUT   /api/records/:id          edit a record
+ *   POST  /api/records/:id/view     log that a record was opened
+ *   POST  /api/records/:id/deed     upload / replace the scanned title deed
+ *   POST  /api/certificate/:title   log certificate generation
+ */
+const express = require("express");
+const path = require("path");
+const { db, audit } = require("../database");
+const { auth } = require("../middleware/auth");
+const { upload } = require("../middleware/upload");
+const { dmy, today } = require("../utils/helpers");
+
+const router = express.Router();
+
+/* ---------- Shared query + row mapper ---------- */
+const SELECT_RECORDS = `
+  SELECT r.*, u.staff_id
+  FROM land_records r
+  JOIN users u ON u.user_id = r.created_by`;
+
+function toRecord(r) {
+  return {
+    id: r.record_id,
+    title: r.title_number,
+    owner: r.owner_name,
+    nid: r.national_id,
+    size: r.parcel_size,
+    loc: r.location,
+    use: r.land_use,
+    date: dmy(r.registration_date),
+    deed: r.deed_path ? path.basename(r.deed_path).replace(/^\d+_/, "") : "",
+    status: r.status,
+    by: r.staff_id,
+  };
+}
+
+const findRecord = (id) =>
+  db.prepare("SELECT * FROM land_records WHERE record_id = ?").get(id);
+
+/* ---------- Search / list ---------- */
+router.get("/api/records", auth(), (req, res) => {
+  const term = `%${String(req.query.q || "").trim()}%`;
+  const rows = db
+    .prepare(
+      `${SELECT_RECORDS}
+       WHERE r.title_number LIKE ? OR r.owner_name LIKE ?
+          OR r.national_id LIKE ? OR r.location LIKE ?
+       ORDER BY r.record_id`,
+    )
+    .all(term, term, term, term);
+
+  res.json({ records: rows.map(toRecord) });
+});
+
+/* ---------- Add a new record ---------- */
+router.post("/api/records", auth(), upload.single("deed"), (req, res) => {
+  const b = req.body;
+  const title = String(b.title || "")
+    .trim()
+    .toUpperCase();
+  const fail = (msg) => res.status(400).json({ error: msg });
+
+  // 1. Validation
+  if (!b.owner || !b.nid || !title || !b.size || !b.loc)
+    return fail(
+      "Fill in owner name, national ID, title number, parcel size and location.",
+    );
+  if (!/^\d{7,8}$/.test(b.nid))
+    return fail("National ID must be 7 or 8 digits.");
+  if (!/^[A-Z]{3}\/\d{1,5}\/\d{4}$/.test(title))
+    return fail("Title number must look like NAK/1234/2026.");
+  if (!(+b.size > 0)) return fail("Parcel size must be more than 0 acres.");
+
+  // 2. Duplicate detection: does this title number already exist?
+  const isDuplicate =
+    db
+      .prepare(
+        "SELECT COUNT(*) c FROM land_records WHERE upper(title_number) = ?",
+      )
+      .get(title).c > 0;
+
+  // 3. Save (a duplicate is stored but flagged, never silently rejected)
+  const result = db
+    .prepare(
+      `INSERT INTO land_records
+         (title_number, owner_name, national_id, parcel_size, location,
+          land_use, registration_date, deed_path, status, created_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      title,
+      b.owner.trim(),
+      b.nid,
+      +b.size,
+      b.loc.trim(),
+      b.use || "Residential",
+      today(),
+      req.file ? "uploads/" + req.file.filename : null,
+      isDuplicate ? "DUPLICATE" : "Active",
+      req.user.user_id,
+    );
+
+  // 4. Audit trail
+  const recordId = result.lastInsertRowid;
+  audit(req.user.user_id, "Created new record", title, recordId);
+  if (isDuplicate)
+    audit(req.user.user_id, "Duplicate flagged", title, recordId);
+
+  res.json({ id: recordId, duplicate: isDuplicate });
+});
+
+/* ---------- Edit a record ---------- */
+router.put("/api/records/:id", auth(), (req, res) => {
+  const record = findRecord(req.params.id);
+  const b = req.body;
+
+  if (!record) return res.status(404).json({ error: "Record not found." });
+  if (
+    !b.owner ||
+    !b.loc ||
+    !(+b.size > 0) ||
+    !["Active", "DUPLICATE"].includes(b.status)
+  )
+    return res
+      .status(400)
+      .json({ error: "Owner, location and a size above 0 are required." });
+
+  db.prepare(
+    `UPDATE land_records
+     SET owner_name = ?, location = ?, parcel_size = ?, status = ?
+     WHERE record_id = ?`,
+  ).run(b.owner.trim(), b.loc.trim(), +b.size, b.status, record.record_id);
+
+  audit(
+    req.user.user_id,
+    "Edited record",
+    record.title_number,
+    record.record_id,
+  );
+  res.json({ ok: true });
+});
+
+/* ---------- Log a record view ---------- */
+router.post("/api/records/:id/view", auth(), (req, res) => {
+  const record = findRecord(req.params.id);
+  if (record)
+    audit(
+      req.user.user_id,
+      "Viewed record",
+      record.title_number,
+      record.record_id,
+    );
+  res.json({ ok: true });
+});
+
+/* ---------- Upload title deed ---------- */
+router.post(
+  "/api/records/:id/deed",
+  auth(),
+  upload.single("deed"),
+  (req, res) => {
+    const record = findRecord(req.params.id);
+    if (!record || !req.file)
+      return res.status(400).json({ error: "Choose a record and a file." });
+
+    db.prepare("UPDATE land_records SET deed_path = ? WHERE record_id = ?").run(
+      "uploads/" + req.file.filename,
+      record.record_id,
+    );
+    audit(
+      req.user.user_id,
+      "Uploaded title deed",
+      record.title_number,
+      record.record_id,
+    );
+    res.json({ ok: true });
+  },
+);
+
+/* ---------- Ownership certificate (only Active records qualify) ---------- */
+router.post("/api/certificate/:title", auth(), (req, res) => {
+  const record = db
+    .prepare(
+      "SELECT * FROM land_records WHERE upper(title_number) = upper(?) AND status = 'Active'",
+    )
+    .get(req.params.title);
+
+  if (!record)
+    return res
+      .status(404)
+      .json({ error: "No active record found for that title number." });
+
+  audit(
+    req.user.user_id,
+    "Generated certificate",
+    record.title_number,
+    record.record_id,
+  );
+  res.json({ ok: true });
+});
+
+module.exports = router;
+````
+
+## 10. `routes/admin.routes.js`
+*Audit trail, user accounts, database viewer*
+
+````javascript
+/** Administrator routes: audit trail, user accounts, database viewer */
+const express = require("express");
+const { db, audit, DB_PATH } = require("../database");
+const { auth } = require("../middleware/auth");
+const { RO, AD, hash } = require("../utils/helpers");
+
+const router = express.Router();
+
+/* admin */
+router.get("/api/audit", auth(AD), (q, s) =>
+  s.json({
+    audit: db
+      .prepare(
+        "SELECT a.logged_at,u.staff_id,u.full_name,a.action,a.record_ref FROM audit_log a JOIN users u ON u.user_id=a.user_id ORDER BY a.log_id DESC",
+      )
+      .all()
+      .map((a) => ({
+        ts: a.logged_at.replace(" ", "T"),
+        user: `${a.staff_id} ${a.full_name.replace(". ", ".")}`,
+        action: a.action,
+        ref: a.record_ref,
+      })),
+  }),
+);
+router.get("/api/users", auth(AD), (q, s) =>
+  s.json({
+    users: db
+      .prepare(
+        "SELECT user_id,staff_id,full_name,role,is_active FROM users ORDER BY user_id",
+      )
+      .all()
+      .map((u) => ({
+        uid: u.user_id,
+        id: u.staff_id,
+        name: u.full_name,
+        role: u.role,
+        active: !!u.is_active,
+      })),
+  }),
+);
+router.post("/api/users", auth(AD), (q, s) => {
+  const b = q.body,
+    id = String(b.id || "")
+      .trim()
+      .toUpperCase();
+  if (
+    !id ||
+    !b.name ||
+    String(b.pw || "").length < 8 ||
+    ![RO, AD].includes(b.role)
+  )
+    return s
+      .status(400)
+      .json({
+        error:
+          "Enter a staff ID, a name and a password of at least 8 characters.",
+      });
+  if (db.prepare("SELECT 1 FROM users WHERE staff_id=?").get(id))
+    return s.status(409).json({ error: "That staff ID already exists." });
+  db.prepare(
+    "INSERT INTO users(staff_id,full_name,password_hash,role) VALUES(?,?,?,?)",
+  ).run(id, b.name.trim(), hash(b.pw), b.role);
+  audit(q.user.user_id, "Created account", id);
+  s.json({ ok: true });
+});
+router.post("/api/users/:uid/toggle", auth(AD), (q, s) => {
+  const u = db.prepare("SELECT * FROM users WHERE user_id=?").get(q.params.uid);
+  if (!u || u.user_id === q.user.user_id)
+    return s.status(400).json({ error: "You cannot change this account." });
+  const a = u.is_active ? 0 : 1;
+  db.prepare(
+    "UPDATE users SET is_active=?,failed_attempts=0 WHERE user_id=?",
+  ).run(a, u.user_id);
+  audit(
+    q.user.user_id,
+    a ? "Activated account" : "Deactivated account",
+    u.staff_id,
+  );
+  s.json({ ok: true });
+});
+
+/* database viewer (admin only): every table, its SQL and its rows; password hashes hidden */
+router.get("/api/db", auth(AD), (q, s) => {
+  const tables = db
+    .prepare(
+      "SELECT name,sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY rowid",
+    )
+    .all()
+    .map((t) => {
+      const cols = db
+          .prepare(`PRAGMA table_info(${t.name})`)
+          .all()
+          .map((c) => c.name),
+        rows = db.prepare(`SELECT * FROM ${t.name} LIMIT 500`).all();
+      rows.forEach((r) => {
+        if ("password_hash" in r) r.password_hash = "(hashed)";
+      });
+      return {
+        name: t.name,
+        sql: t.sql,
+        cols,
+        rows,
+        count: db.prepare(`SELECT COUNT(*) c FROM ${t.name}`).get().c,
+      };
+    });
+  s.json({ tables });
+});
+router.get("/api/db/download", auth(AD), (q, s) =>
+  s.download(DB_PATH, "landtrust.db"),
+);
+
+module.exports = router;
+````
+
+## 11. `public/index.html`
+*Page that loads the CSS and scripts*
+
+````html
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, viewport-fit=cover"
+    />
+    <title>LandTrust Kenya – Land Records Management System</title>
+    <link rel="stylesheet" href="css/style.css" />
+  </head>
+  <body>
+    <div id="root"></div>
+    <div id="toast" role="status"></div>
+    <dialog id="dlg"></dialog>
+    <script src="js/core.js"></script>
+    <script src="js/login.js"></script>
+    <script src="js/app.js"></script>
+    <script src="js/records.js"></script>
+    <script src="js/admin.js"></script>
+    <script src="js/main.js"></script>
+  </body>
+</html>
+````
+
+## 12. `public/css/style.css`
+*Styling for login and both dashboards*
+
+````css
+:root {
+  --navy: #1f4e79;
+  --blue: #2e6da4;
+  --head: #1f4e79;
+  --bg: #f4f6f8;
+  --card: #fff;
+  --line: #b8c2cc;
+  --row: #e3e8ed;
+  --text: #2b2b2b;
+  --mute: #6b7680;
+  --redbg: #fde8e8;
+  --red: #c0392b;
+  --grnbg: #e6f0e6;
+  --grn: #2e7d32;
+  --field: #f7f9fb;
+  box-sizing: border-box;
+  padding-top: env(safe-area-inset-top, 0px);
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --head: #8fc0ea;
+    --bg: #12181e;
+    --card: #1b232b;
+    --line: #3a4650;
+    --row: #2a343d;
+    --text: #e6ebef;
+    --mute: #9aa7b2;
+    --redbg: #3a1d1d;
+    --red: #ff8a80;
+    --grnbg: #1d3324;
+    --grn: #7fd28a;
+    --field: #141b21;
+  }
+}
+:root[data-theme="dark"] {
+  --head: #8fc0ea;
+  --bg: #12181e;
+  --card: #1b232b;
+  --line: #3a4650;
+  --row: #2a343d;
+  --text: #e6ebef;
+  --mute: #9aa7b2;
+  --redbg: #3a1d1d;
+  --red: #ff8a80;
+  --grnbg: #1d3324;
+  --grn: #7fd28a;
+  --field: #141b21;
+}
+* {
+  box-sizing: border-box;
+}
+html,
+body {
+  margin: 0;
+  min-height: 100%;
+}
+body {
+  background: var(--bg);
+  color: var(--text);
+  font:
+    15px/1.45 Arial,
+    Helvetica,
+    sans-serif;
+}
+h1,
+h2 {
+  color: var(--head);
+  margin: 0 0 14px;
+  font-size: 22px;
+}
+h2 {
+  font-size: 19px;
+  margin-top: 26px;
+}
+label {
+  display: block;
+  font-weight: 700;
+  margin: 14px 0 6px;
+}
+input,
+select {
+  width: 100%;
+  padding: 11px 12px;
+  border: 2px solid var(--line);
+  border-radius: 8px;
+  background: var(--field);
+  color: var(--text);
+  font: inherit;
+}
+input:focus-visible,
+select:focus-visible,
+button:focus-visible,
+a:focus-visible {
+  outline: 3px solid var(--blue);
+  outline-offset: 2px;
+}
+button {
+  font: inherit;
+  font-weight: 700;
+  padding: 11px 20px;
+  border-radius: 8px;
+  border: 2px solid var(--navy);
+  background: var(--navy);
+  color: #fff;
+  cursor: pointer;
+}
+button.ghost {
+  background: var(--card);
+  color: var(--head);
+  border-color: var(--line);
+}
+a.lnk {
+  color: var(--head);
+  font-weight: 700;
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+  text-decoration: none;
+}
+.login {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+}
+.lcard {
+  background: var(--card);
+  border: 2px solid var(--navy);
+  border-radius: 16px;
+  width: 100%;
+  max-width: 440px;
+  padding: 32px 30px;
+}
+.lcard h1 {
+  text-align: center;
+  font-size: 26px;
+  margin-bottom: 4px;
+}
+.sub {
+  text-align: center;
+  color: var(--mute);
+  margin: 0 0 18px;
+  padding-bottom: 14px;
+  border-bottom: 2px solid var(--row);
+}
+.roles {
+  display: flex;
+  gap: 28px;
+  margin-top: 6px;
+}
+.roles label {
+  font-weight: 400;
+  margin: 0;
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.roles input {
+  width: auto;
+}
+.err {
+  background: var(--redbg);
+  color: var(--red);
+  border: 2px solid var(--red);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin: 14px 0 0;
+}
+.hint {
+  color: var(--mute);
+  font-size: 13px;
+  text-align: center;
+  margin: 14px 0 0;
+}
+.app {
+  display: flex;
+  min-height: 100vh;
+}
+.side {
+  width: 230px;
+  background: var(--navy);
+  color: #fff;
+  flex: none;
+  display: flex;
+  flex-direction: column;
+}
+.side .who {
+  text-align: center;
+  font-weight: 700;
+  padding: 28px 10px 6px;
+}
+.side .nm {
+  text-align: center;
+  font-size: 13px;
+  opacity: 0.8;
+  padding-bottom: 22px;
+}
+.side button {
+  background: none;
+  border: 0;
+  border-radius: 0;
+  color: #fff;
+  text-align: left;
+  font-weight: 400;
+  padding: 14px 26px;
+  width: 100%;
+}
+.side button.on {
+  background: var(--blue);
+  font-weight: 700;
+}
+main {
+  flex: 1;
+  padding: 24px 28px;
+  min-width: 0;
+}
+.grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0 28px;
+}
+.row {
+  display: flex;
+  gap: 12px;
+  margin-top: 26px;
+  flex-wrap: wrap;
+}
+.srch {
+  display: flex;
+  gap: 16px;
+}
+.srch button {
+  flex: none;
+}
+.alert {
+  background: var(--redbg);
+  color: var(--red);
+  border: 2px solid var(--red);
+  border-radius: 8px;
+  padding: 11px 16px;
+  margin-bottom: 6px;
+}
+.wrap {
+  overflow-x: auto;
+  margin-top: 16px;
+}
+table {
+  border-collapse: collapse;
+  width: 100%;
+  background: var(--card);
+  min-width: 560px;
+}
+th {
+  background: var(--navy);
+  color: #fff;
+  padding: 13px 10px;
+}
+td {
+  padding: 13px 10px;
+  text-align: center;
+  border-bottom: 1px solid var(--row);
+}
+.pill {
+  display: inline-block;
+  padding: 4px 18px;
+  border-radius: 14px;
+  font-size: 13px;
+  font-weight: 700;
+  background: var(--grnbg);
+  color: var(--grn);
+}
+.pill.dup {
+  background: var(--redbg);
+  color: var(--red);
+}
+.pill.off {
+  background: var(--row);
+  color: var(--mute);
+}
+.stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 16px;
+}
+.stat {
+  background: var(--card);
+  border: 2px solid var(--row);
+  border-radius: 10px;
+  padding: 16px;
+}
+.stat b {
+  display: block;
+  font-size: 28px;
+  color: var(--head);
+}
+.cert {
+  background: #fff;
+  color: #222;
+  border: 3px double var(--navy);
+  padding: 28px;
+  margin-top: 20px;
+  max-width: 640px;
+}
+.cert h3 {
+  text-align: center;
+  color: #1f4e79;
+  margin: 0 0 4px;
+}
+.cert p {
+  margin: 6px 0;
+}
+.cert .c {
+  text-align: center;
+  color: #555;
+}
+dialog {
+  border: 2px solid var(--navy);
+  border-radius: 12px;
+  background: var(--card);
+  color: var(--text);
+  width: min(560px, 92vw);
+}
+dialog::backdrop {
+  background: #0008;
+}
+#toast {
+  position: fixed;
+  left: 50%;
+  bottom: calc(20px + env(safe-area-inset-bottom, 0px));
+  transform: translateX(-50%);
+  background: var(--navy);
+  color: #fff;
+  padding: 11px 20px;
+  border-radius: 8px;
+  display: none;
+  z-index: 9;
+}
+@media (max-width: 760px) {
+  .app {
+    flex-direction: column;
+  }
+  .side {
+    width: 100%;
+    flex-direction: row;
+    flex-wrap: wrap;
+  }
+  .side .who,
+  .side .nm {
+    display: none;
+  }
+  .side button {
+    width: auto;
+    padding: 12px 14px;
+  }
+  .grid {
+    grid-template-columns: 1fr;
+  }
+  main {
+    padding: 18px 14px;
+  }
+  .srch {
+    flex-direction: column;
+    gap: 10px;
+  }
+}
+@media print {
+  body * {
+    visibility: hidden;
+  }
+  #cert,
+  #cert * {
+    visibility: visible;
+  }
+  #cert {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 100%;
+    max-width: none;
+  }
+}
+````
+
+## 13. `public/js/core.js`
+*Shared state and the API client*
+
+````javascript
+/** Shared state, helpers, and the API client */
+
+const $ = (id) => document.getElementById(id);
+const esc = (s) =>
+  String(s).replace(
+    /[&<>"']/g,
+    (c) =>
+      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[
+        c
+      ],
+  );
+const M = [
+    "Jan",
+    "Feb",
+    "Mar",
+    "Apr",
+    "May",
+    "Jun",
+    "Jul",
+    "Aug",
+    "Sep",
+    "Oct",
+    "Nov",
+    "Dec",
+  ],
+  p2 = (n) => String(n).padStart(2, "0");
+const fmt = (d, t) =>
+  `${p2(d.getDate())}-${M[d.getMonth()]}-${d.getFullYear()}` +
+  (t ? ` ${p2(d.getHours())}:${p2(d.getMinutes())}` : "");
+const D = (y, m, d, h, mi) => new Date(y, m, d, h, mi);
+const RO = "Records Officer",
+  AD = "Administrator";
+const db = { users: [], recs: [], audit: [] };
+let S = null,
+  view = "dash",
+  dupBanner = "",
+  certRec = null,
+  q = "";
+const NAV = {
+  [RO]: [
+    ["dash", "Dashboard"],
+    ["add", "Add Land Record"],
+    ["search", "Search Records"],
+    ["upload", "Upload Title Deed"],
+    ["dups", "Duplicate Alerts"],
+    ["out", "Logout"],
+  ],
+  [AD]: [
+    ["dash", "Dashboard"],
+    ["users", "User Accounts"],
+    ["perms", "Permissions"],
+    ["audit", "Audit Trail"],
+    ["reports", "Generate Reports"],
+    ["dbv", "Database"],
+    ["out", "Logout"],
+  ],
+};
+async function api(p, o = {}) {
+  try {
+    const r = await fetch(p, { credentials: "same-origin", ...o });
+    let j = {};
+    try {
+      j = await r.json();
+    } catch (e) {}
+    return { ok: r.ok, status: r.status, ...j };
+  } catch (e) {
+    return {
+      ok: false,
+      error: "Cannot reach the server. Make sure it is running (npm start).",
+    };
+  }
+}
+const jp = (p, b, m = "POST") =>
+  api(p, {
+    method: m,
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(b),
+  });
+async function load() {
+  const r = await api("/api/records");
+  db.recs = r.records || [];
+  if (S.role === AD) {
+    const u = await api("/api/users");
+    db.users = u.users || [];
+    const a = await api("/api/audit");
+    db.audit = (a.audit || []).map((x) => [
+      new Date(x.ts),
+      x.user,
+      x.action,
+      x.ref,
+    ]);
+  }
+}
+function toast(m) {
+  const t = $("toast");
+  t.textContent = m;
+  t.style.display = "block";
+  clearTimeout(t._h);
+  t._h = setTimeout(() => (t.style.display = "none"), 2600);
+}
+````
+
+## 14. `public/js/login.js`
+*Login page*
+
+````javascript
+/** Login page */
+/* ---------- LOGIN ---------- */
+function showLogin(msg) {
+  $("root").innerHTML =
+    `<div class="login"><form class="lcard" onsubmit="doLogin(event)" novalidate>
+ <h1>LandTrust Kenya</h1><p class="sub">Land Records Management System</p>
+ <label for="u">Username / Staff ID</label><input id="u" placeholder="e.g. RO-2026-014" autocomplete="username" autofocus>
+ <label for="p">Password</label><input id="p" type="password" autocomplete="current-password">
+ <label style="margin-bottom:0">Login as:</label>
+ <div class="roles"><label><input type="radio" name="r" value="${RO}" checked> Records Officer</label><label><input type="radio" name="r" value="${AD}"> Administrator</label></div>
+ <div id="le" class="err" role="alert" style="${msg ? "" : "display:none"}">${esc(msg || "")}</div>
+ <button style="width:100%;margin-top:22px;font-size:17px">LOGIN</button>
+ <p class="hint">Forgot password? Contact system administrator</p>
+ <p class="hint">Demo: RO-2026-014 / officer123 (Records Officer) · ADM-002 / admin123 (Administrator)</p></form></div>`;
+}
+async function doLogin(e) {
+  e.preventDefault();
+  const id = $("u").value.trim(),
+    pw = $("p").value,
+    role = document.querySelector("input[name=r]:checked").value;
+  const bad = (m) => {
+    const x = $("le");
+    x.textContent = m;
+    x.style.display = "block";
+  };
+  if (!id || !pw) return bad("Enter your staff ID and password.");
+  const r = await jp("/api/login", { id, pw, role });
+  if (!r.ok) return bad(r.error || "Login failed.");
+  S = r.user;
+  view = "dash";
+  certRec = null;
+  dupBanner = "";
+  q = "";
+  await load();
+  shell();
+}
+async function logout() {
+  await jp("/api/logout", {});
+  S = null;
+  db.recs = [];
+  db.users = [];
+  db.audit = [];
+  showLogin();
+}
+````
+
+## 15. `public/js/app.js`
+*Sidebar, navigation and Dashboard*
+
+````javascript
+/** Page shell, sidebar navigation and Dashboard */
+/* ---------- SHELL ---------- */
+function shell() {
+  const nav = NAV[S.role]
+    .map(
+      ([k, l]) =>
+        `<button class="${k === view ? "on" : ""}" onclick="go('${k}')">${l}</button>`,
+    )
+    .join("");
+  $("root").innerHTML =
+    `<div class="app"><nav class="side" aria-label="Main"><div class="who">${S.role.toUpperCase()}</div><div class="nm">${esc(S.id)} · ${esc(S.name)}</div>${nav}</nav><main id="m"></main></div>`;
+  const V = {
+    dash,
+    add,
+    search,
+    upload,
+    dups,
+    users,
+    perms,
+    audit,
+    reports,
+    dbv,
+  };
+  $("m").innerHTML = V[view]();
+}
+async function go(k) {
+  if (k === "out") return logout();
+  view = k;
+  if (k !== "add") dupBanner = "";
+  await load();
+  shell();
+}
+const pill = (s) =>
+  `<span class="pill ${s === "Active" ? "" : s === "DUPLICATE" ? "dup" : "off"}">${s}</span>`;
+
+function dash() {
+  const d = db.recs.filter((r) => r.status === "DUPLICATE").length;
+  let h =
+    `<h1>Dashboard</h1><div class="stats"><div class="stat"><b>${db.recs.length}</b>Land records</div><div class="stat"><b>${d}</b>Duplicate alerts</div>` +
+    (S.role === AD
+      ? `<div class="stat"><b>${db.users.length}</b>Staff accounts</div><div class="stat"><b>${db.audit.length}</b>Audit entries</div>`
+      : `<div class="stat"><b>${db.recs.filter((r) => r.by === S.id).length}</b>Records you added</div>`) +
+    "</div>";
+  return (
+    h +
+    `<h2>Search Land Records</h2>${srch()}<div id="res">${tbl(found())}</div>`
+  );
+}
+````
+
+## 16. `public/js/records.js`
+*LAND RECORDS screens: search, add, upload deed, duplicates, edit*
+
+````javascript
+/**
+ * Land record screens (Records Officer)
+ *   Search Records  ·  Add Land Record  ·  Upload Title Deed
+ *   Duplicate Alerts  ·  View / Edit window
+ * Data comes from the server (db.recs) via the helpers in core.js.
+ */
+
+const idx = (record) => db.recs.indexOf(record);
+
+/* ---------- Duplicate helpers ---------- */
+const dupMsg = (title) => `
+  <div class="alert" role="alert">
+    ALERT — Duplicate Record: Title No. ${esc(title)} already exists in database
+  </div>`;
+
+const isDup = (title) =>
+  db.recs.some((r) => r.title.toUpperCase() === title.toUpperCase());
+
+/* ============================================================
+   SEARCH RECORDS
+   ============================================================ */
+function tbl(rows) {
+  if (!rows.length) {
+    return "<p>No records match your search. Try a title number, owner name or parcel ID.</p>";
+  }
+
+  const body = rows
+    .map(
+      (r) => `
+      <tr>
+        <td>${esc(r.title)}</td>
+        <td>${esc(r.owner)}</td>
+        <td>${r.size} Ac</td>
+        <td>${esc(r.loc)}</td>
+        <td>${pill(r.status)}</td>
+        <td>
+          <button style="all:unset;cursor:pointer;color:var(--head);font-weight:700"
+                  onclick="edit(${idx(r)})">
+            ${r.status === "DUPLICATE" ? "Review" : "View / Edit"}
+          </button>
+        </td>
+      </tr>`,
+    )
+    .join("");
+
+  return `
+    <div class="wrap">
+      <table>
+        <tr>
+          <th>Title No.</th><th>Owner Name</th><th>Parcel Size</th>
+          <th>Location</th><th>Status</th><th>Actions</th>
+        </tr>
+        ${body}
+      </table>
+    </div>`;
+}
+
+// Filter the loaded records by title, owner, national ID or location
+function found() {
+  const term = q.toLowerCase();
+  return db.recs.filter(
+    (r) =>
+      !term ||
+      [r.title, r.owner, r.nid, r.loc].some((v) =>
+        v.toLowerCase().includes(term),
+      ),
+  );
+}
+
+function srch() {
+  return `
+    <div class="srch">
+      <input id="q" value="${esc(q)}" aria-label="Search records"
+             placeholder="Search by Title No. / Owner Name / Parcel ID ..."
+             onkeydown="if (event.key === 'Enter') runQ()">
+      <button onclick="runQ()">Search</button>
+    </div>`;
+}
+
+function runQ() {
+  q = $("q").value.trim();
+  $("res").innerHTML = tbl(found());
+}
+
+function search() {
+  return `
+    <h1>Search Land Records</h1>
+    ${srch()}
+    <div id="res">${tbl(found())}</div>`;
+}
+
+/* ============================================================
+   ADD LAND RECORD
+   ============================================================ */
+function add() {
+  return `
+    <h1>Add New Land Record</h1>
+    <div id="db">${dupBanner}</div>
+
+    <form onsubmit="save(event)" novalidate>
+      <div class="grid">
+        <div>
+          <label for="f_o">Owner Full Name</label>
+          <input id="f_o">
+
+          <label for="f_n">National ID No.</label>
+          <input id="f_n" inputmode="numeric" placeholder="7–8 digits">
+
+          <label for="f_t">Title / Parcel Number</label>
+          <input id="f_t" placeholder="NAK/1234/2026" onblur="chkDup()">
+
+          <label for="f_s">Parcel Size (Acres)</label>
+          <input id="f_s" type="number" step="0.01" min="0">
+        </div>
+
+        <div>
+          <label for="f_l">Location / Ward</label>
+          <input id="f_l">
+
+          <label for="f_u">Land Use Type</label>
+          <select id="f_u">
+            <option>Residential</option>
+            <option>Agricultural</option>
+            <option>Commercial</option>
+            <option>Industrial</option>
+          </select>
+
+          <label for="f_d">Registration Date</label>
+          <input id="f_d" value="${fmt(new Date())}" readonly>
+
+          <label for="f_f">Scanned Title Deed</label>
+          <input id="f_f" type="file" accept=".pdf,image/*">
+        </div>
+      </div>
+
+      <p id="fe" class="err" role="alert" style="display:none"></p>
+
+      <div class="row" style="margin-top:20px">
+        <button>Save Record</button>
+        <button type="button" class="ghost" onclick="go('dash')">Cancel</button>
+      </div>
+    </form>`;
+}
+
+// Warn as soon as the officer leaves the title field
+function chkDup() {
+  const title = $("f_t").value.trim();
+  $("db").innerHTML = title && isDup(title) ? dupMsg(title.toUpperCase()) : "";
+}
+
+async function save(e) {
+  e.preventDefault();
+  const val = (id) => $(id).value.trim();
+  const title = val("f_t").toUpperCase();
+  const showError = (msg) => {
+    const box = $("fe");
+    box.textContent = msg;
+    box.style.display = "block";
+  };
+
+  // Client-side validation (the server checks again)
+  if (!val("f_o") || !val("f_n") || !title || !val("f_s") || !val("f_l"))
+    return showError(
+      "Fill in owner name, national ID, title number, parcel size and location.",
+    );
+  if (!/^\d{7,8}$/.test(val("f_n")))
+    return showError("National ID must be 7 or 8 digits.");
+  if (!/^[A-Z]{3}\/\d{1,5}\/\d{4}$/.test(title))
+    return showError("Title number must look like NAK/1234/2026.");
+  if (!(+val("f_s") > 0))
+    return showError("Parcel size must be more than 0 acres.");
+
+  // Send to the server as multipart form data (carries the deed file)
+  const form = new FormData();
+  form.append("owner", val("f_o"));
+  form.append("nid", val("f_n"));
+  form.append("title", title);
+  form.append("size", val("f_s"));
+  form.append("loc", val("f_l"));
+  form.append("use", $("f_u").value);
+  const deed = $("f_f").files[0];
+  if (deed) form.append("deed", deed);
+
+  const res = await api("/api/records", { method: "POST", body: form });
+  if (!res.ok) return showError(res.error || "Could not save the record.");
+
+  if (res.duplicate) {
+    dupBanner = dupMsg(title);
+    toast("Saved and flagged as duplicate");
+  } else {
+    dupBanner = "";
+    toast("Record saved");
+  }
+  await load();
+  shell();
+}
+
+/* ============================================================
+   UPLOAD TITLE DEED
+   ============================================================ */
+function upload() {
+  const options = db.recs
+    .map(
+      (r, i) =>
+        `<option value="${i}">${esc(r.title)} — ${esc(r.owner)}${r.deed ? " (has deed)" : ""}</option>`,
+    )
+    .join("");
+
+  return `
+    <h1>Upload Title Deed</h1>
+    <form onsubmit="upl(event)" style="max-width:520px">
+      <label for="ur">Land record</label>
+      <select id="ur">${options}</select>
+
+      <label for="uf">Scanned title deed (PDF or image)</label>
+      <input id="uf" type="file" accept=".pdf,image/*">
+
+      <p id="ue" class="err" role="alert" style="display:none"></p>
+      <div class="row" style="margin-top:20px"><button>Upload deed</button></div>
+    </form>`;
+}
+
+async function upl(e) {
+  e.preventDefault();
+  const file = $("uf").files[0];
+  const box = $("ue");
+  const showError = (msg) => {
+    box.textContent = msg;
+    box.style.display = "block";
+  };
+
+  if (!file) return showError("Choose a file to upload.");
+
+  const form = new FormData();
+  form.append("deed", file);
+  const record = db.recs[+$("ur").value];
+  const res = await api(`/api/records/${record.id}/deed`, {
+    method: "POST",
+    body: form,
+  });
+  if (!res.ok) return showError(res.error || "Upload failed.");
+
+  toast("Deed uploaded");
+  await load();
+  shell();
+}
+
+/* ============================================================
+   DUPLICATE ALERTS
+   ============================================================ */
+function dups() {
+  const flagged = db.recs.filter((r) => r.status === "DUPLICATE");
+  const content = flagged.length
+    ? flagged.map((r) => dupMsg(r.title)).join("") + tbl(flagged)
+    : "<p>No duplicate records. New duplicates appear here as soon as they are detected.</p>";
+  return `<h1>Duplicate Alerts</h1>${content}`;
+}
+
+/* ============================================================
+   VIEW / EDIT RECORD (pop-up window)
+   ============================================================ */
+function edit(i) {
+  const r = db.recs[i];
+  const dialog = $("dlg");
+
+  dialog.innerHTML = `
+    <form method="dialog" onsubmit="return upd(event, ${i})">
+      <h1>${esc(r.title)}</h1>
+
+      <label for="e_o">Owner Full Name</label>
+      <input id="e_o" value="${esc(r.owner)}">
+
+      <label for="e_l">Location / Ward</label>
+      <input id="e_l" value="${esc(r.loc)}">
+
+      <label for="e_s">Parcel Size (Acres)</label>
+      <input id="e_s" type="number" step="0.01" value="${r.size}">
+
+      <label for="e_st">Status</label>
+      <select id="e_st">
+        <option ${r.status === "Active" ? "selected" : ""}>Active</option>
+        <option ${r.status === "DUPLICATE" ? "selected" : ""}>DUPLICATE</option>
+      </select>
+
+      <p style="color:var(--mute)">
+        National ID ${esc(r.nid)} · Deed: ${esc(r.deed || "not uploaded")}
+      </p>
+
+      <div class="row" style="margin-top:8px">
+        <button>Save changes</button>
+        <button type="button" class="ghost" onclick="$('dlg').close()">Close</button>
+      </div>
+    </form>`;
+
+  api(`/api/records/${r.id}/view`, { method: "POST" }); // audit: record viewed
+  dialog.showModal();
+}
+
+function upd(e, i) {
+  const r = db.recs[i];
+  const owner = $("e_o").value.trim();
+  const loc = $("e_l").value.trim();
+  const size = +$("e_s").value;
+
+  if (!owner || !loc || !(size > 0)) {
+    toast("Owner, location and a size above 0 are required");
+    return false;
+  }
+
+  jp(
+    `/api/records/${r.id}`,
+    { owner, loc, size, status: $("e_st").value },
+    "PUT",
+  ).then(async (res) => {
+    if (!res.ok) return toast(res.error || "Could not save");
+    toast("Changes saved");
+    await load();
+    shell();
+  });
+  return true;
+}
+````
+
+## 17. `public/js/admin.js`
+*User accounts, permissions, audit trail, reports, database viewer*
+
+````javascript
+/** Administrator screens: users, permissions, audit trail, reports, database viewer */
+/* ---------- ADMIN ---------- */
+function users() {
+  return `<h1>User Accounts</h1><div class="wrap"><table><tr><th>Staff ID</th><th>Name</th><th>Role</th><th>Status</th><th>Actions</th></tr>${db.users
+    .map(
+      (u, i) =>
+        `<tr><td>${esc(u.id)}</td><td>${esc(u.name)}</td><td>${u.role}</td><td>${pill(u.active ? "Active" : "Locked")}</td><td>${u.id === S.id ? "—" : `<button style="all:unset;cursor:pointer;color:var(--head);font-weight:700" onclick="tgl(${i})">${u.active ? "Deactivate" : "Activate"}</button>`}</td></tr>`,
+    )
+    .join("")}</table></div>
+ <h2>Add Staff Account</h2><form onsubmit="addU(event)" style="max-width:520px"><label for="n_i">Staff ID</label><input id="n_i" placeholder="RO-2026-021"><label for="n_n">Name</label><input id="n_n">
+ <label for="n_p">Temporary password (8+ characters)</label><input id="n_p" type="password"><label for="n_r">Role</label><select id="n_r"><option>${RO}</option><option>${AD}</option></select>
+ <p id="ne" class="err" role="alert" style="display:none"></p><div class="row" style="margin-top:20px"><button>Create account</button></div></form>`;
+}
+async function tgl(i) {
+  const r = await jp("/api/users/" + db.users[i].uid + "/toggle", {});
+  if (!r.ok) toast(r.error);
+  await load();
+  shell();
+}
+async function addU(e) {
+  e.preventDefault();
+  const x = $("ne"),
+    er = (m) => {
+      x.textContent = m;
+      x.style.display = "block";
+    };
+  const r = await jp("/api/users", {
+    id: $("n_i").value,
+    name: $("n_n").value,
+    pw: $("n_p").value,
+    role: $("n_r").value,
+  });
+  if (!r.ok) return er(r.error || "Could not create the account.");
+  toast("Account created");
+  await load();
+  shell();
+}
+const CAP = [
+  ["Log in", "1,1"],
+  ["Add and edit land records", "1,1"],
+  ["Search and retrieve records", "1,1"],
+  ["Upload scanned title deeds", "1,1"],
+  ["View duplicate alerts", "1,1"],
+  ["Generate ownership reports", "1,1"],
+  ["Manage user accounts and permissions", "0,1"],
+  ["View audit trail", "0,1"],
+];
+function perms() {
+  return `<h1>Permissions</h1><p>Access is granted by role. These permissions are enforced at login and on every panel.</p><div class="wrap"><table><tr><th>Capability</th><th>${RO}</th><th>${AD}</th></tr>${CAP.map(
+    ([c, v]) => {
+      const [a, b] = v.split(",");
+      return `<tr><td style="text-align:left">${c}</td><td>${a === "1" ? "Allowed" : "—"}</td><td>${b === "1" ? "Allowed" : "—"}</td></tr>`;
+    },
+  ).join("")}</table></div>`;
+}
+function auditTbl() {
+  return `<div class="wrap"><table><tr><th>Date / Time</th><th>User</th><th>Action</th><th>Record ID</th></tr>${db.audit
+    .map(
+      (a) =>
+        `<tr><td>${fmt(a[0], 1)}</td><td>${esc(a[1])}</td><td>${esc(a[2])}</td><td>${esc(a[3])}</td></tr>`,
+    )
+    .join("")}</table></div>`;
+}
+function genBox() {
+  return `<h2>Generate Ownership Report / Certificate</h2><label for="g_t">Title / Parcel Number</label><div class="srch"><input id="g_t" placeholder="NAK/0456/2021" onkeydown="if(event.key==='Enter')gen()"><button onclick="gen()">Generate</button><button class="ghost" onclick="pdf()">Download PDF</button></div><p id="ge" class="err" role="alert" style="display:none"></p><div id="certbox"></div>`;
+}
+function audit() {
+  return `<h1>Audit Trail / Activity Log</h1>${auditTbl()}${genBox()}`;
+}
+function reports() {
+  return `<h1>Generate Reports</h1>${genBox()}`;
+}
+function gen() {
+  const t = $("g_t").value.trim().toUpperCase(),
+    x = $("ge");
+  x.style.display = "none";
+  const r = db.recs.find(
+    (r) => r.title.toUpperCase() === t && r.status === "Active",
+  );
+  if (!r) {
+    certRec = null;
+    $("certbox").innerHTML = "";
+    x.textContent = t
+      ? "No active record found for that title number. Check the number or resolve duplicates first."
+      : "Enter a title / parcel number.";
+    x.style.display = "block";
+    return;
+  }
+  certRec = r;
+  jp("/api/certificate/" + encodeURIComponent(r.title), {});
+  const n = new Date();
+  $("certbox").innerHTML =
+    `<div class="cert" id="cert"><h3>LandTrust Kenya, Nakuru</h3><p class="c">Certificate of Ownership Record</p><hr>
+ <p><b>Title / Parcel No.:</b> ${esc(r.title)}</p><p><b>Registered owner:</b> ${esc(r.owner)}</p><p><b>National ID:</b> ${esc(r.nid.slice(0, 5))}xxx</p>
+ <p><b>Parcel size:</b> ${r.size} acres</p><p><b>Location:</b> ${esc(r.loc)}</p><p><b>Land use:</b> ${esc(r.use)}</p><p><b>Registered on:</b> ${esc(r.date)}</p>
+ <p><b>Title deed on file:</b> ${r.deed ? "Yes" : "No"}</p><hr><p class="c">Generated ${fmt(n, 1)} by ${esc(S.id)} ${esc(S.name)}</p></div>`;
+}
+function pdf() {
+  if (!certRec) return gen();
+  window.print();
+}
+function dbv() {
+  setTimeout(loadDb, 0);
+  return `<h1>Database Viewer</h1><p>Live contents of landtrust.db. Password hashes are hidden.</p><div id="dbx">Loading…</div>`;
+}
+async function loadDb() {
+  const r = await api("/api/db"),
+    x = $("dbx");
+  if (!x) return;
+  if (!r.ok) {
+    x.textContent = r.error || "Could not load the database.";
+    return;
+  }
+  window._t = r.tables;
+  showT(0);
+}
+function showT(i) {
+  const t = window._t[i],
+    x = $("dbx");
+  if (!x) return;
+  x.innerHTML = `<div class="row" style="margin-top:0">${window._t.map((a, j) => `<button class="${j === i ? "" : "ghost"}" onclick="showT(${j})">${a.name} (${a.count})</button>`).join("")}<a class="lnk" style="align-self:center" href="/api/db/download">Download landtrust.db</a></div>
+ <h2>${t.name}</h2><pre style="white-space:pre-wrap;color:var(--mute)">${esc(t.sql)}</pre><div class="wrap"><table><tr>${t.cols.map((c) => `<th>${esc(c)}</th>`).join("")}</tr>${t.rows.map((r) => `<tr>${t.cols.map((c) => `<td>${esc(r[c] ?? "")}</td>`).join("")}</tr>`).join("")}</table></div>`;
+}
+````
+
+## 18. `public/js/main.js`
+*Start-up*
+
+````javascript
+/** Start-up: restore an existing session or show the login page */
+(async () => {
+  const r = await api("/api/me");
+  if (r.ok) {
+    S = r.user;
+    await load();
+    shell();
+  } else showLogin();
+})();
+````
